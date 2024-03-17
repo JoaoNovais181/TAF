@@ -10,17 +10,19 @@ executor=ThreadPoolExecutor(max_workers=1)
 
 data = {}
 requests = []
+serverRequests = []
 waitingR, waitingW, waitingU = False, False, False
 
-quorumSizeR, quorumSizeW = len(node_ids), 1
+quorumSizeR, quorumSizeW = 1, 0
 
-acks = []
+acksR, acksW, acksU = [], [], []
 timestamp = 0
 
 def handle(msg):
 
     # State
-    global node_id, node_ids, data, requests, waiting, timestamp, acks, quorumSizeR, quorumSizeW
+    global node_id, node_ids, data, requests, waiting, timestamp, acksR, acksW, acksU, quorumSizeR, quorumSizeW, serverRequests
+    logging.info(f"\n\n{data = }\n\n")
 
     timestamp += 1
 
@@ -33,107 +35,150 @@ def handle(msg):
         return value
 
     def writeQuorum(key):
-        waitingW = True
-        acks.append(timestamp)
+        logging.info("EXECUTING WRITE QUORUM\n")
+        acksW.append(timestamp)
         for node in node_ids:
             if node != node_id:
                 send(src=node_id, dest=node, type="quorumw", key=key)
     
     def readQuorum(key):
-        waitingR = True
-        val = (None, -1, node_id())
+        logging.info("EXECUTING READ QUORUM\n")
+        val = ("None", -1, node_id)
         if key in data.keys():
-            val = (data[key][0], data[key][1], node_id())
-        acks.append(val)
+            val = (data[key][0], data[key][1], node_id)
+        acksR.append(val)
         for node in node_ids:
             if node != node_id:
                 send(src=node_id, dest=node, type="quorumr", key=key)
 
     def update(key, value):
+        logging.info("EXECUTING VALUE UPDATE\n")
         for node in node_ids:
             if node != node_id:
-                send(src=node_id, dest=node, type="update", key=key, value=value)
+                send(src=node_id, dest=node, type="update", key=key, value=value, timestamp=timestamp)
     
     def waitingHandler(msg):
+        global node_id, node_ids, data, requests, waitingW, waitingR, waitingU, timestamp, acksR, acksW, acksU, quorumSizeR, quorumSizeW
+        logging.debug(f"\n\n{msg = }")
         if waitingR and msg.body.type == "ackr":
-            acks.append((msg.body.value, msg.body.timestamp, msg.src))
-            acks.sort(key=lambda val: val[2])
-            acks.sort(key=lambda val: val[1], reverse=True)
+            acksR.append((msg.body.value, msg.body.timestamp, msg.src))
+            logging.info(f"\n\n{acksR = }\n\n")
+            acksR.sort(key=lambda val: val[2])
+            acksR.sort(key=lambda val: val[1], reverse=True)
 
-            if len(acks) > quorumSizeR:
-                returnVal = acks[0]
-                change(requests[0].body.key, (returnVal[0], returnVal[1]))
+            if len(acksR) >= quorumSizeR:
+                returnVal = acksR[0]
 
-                if returnVal != -1:
+                if returnVal[0] != "None":
+                    change(requests[0].body.key, (returnVal[0], returnVal[1]))
                     reply(requests[0], type="read_ok", value=returnVal[0])
                 else:
                     reply(requests[0], type="error", code=20, text=f"Key {requests[0].body.key} not found..")
 
-                requests.pop(0)
-                acks.clear()
+                acksR.clear()
                 waitingR = False
+                requests.pop(0)
+                clientMsgHandler()
     
         elif waitingW and msg.body.type == "ackw":
-            acks.append(msg.body.timestamp)
-            acks.sort()
-
-            if len(acks) > quorumSizeW:
-                tim = max(acks)
+            acksW.append(msg.body.timestamp)
+            logging.debug(f"\n{acksW = } {quorumSizeW = }")
+            acksW.sort()
+            
+            if len(acksW) >= quorumSizeW:
+                tim = max(acksW)
                 timestamp = tim + 1
-                change(requests[0].body.key, (requests[0].body.value, timestamp))
+                logging.info(f"{requests = } {serverRequests = }")
+                body = requests[0].body
+                key, value = body.key, body.value
+                change(key, (value, timestamp))
 
+                update(key, value)
 
+                acksW.clear()
+                acksU.append(node_id)
+                waitingW = False
+                waitingU = True
 
+        elif waitingU and msg.body.type == "acku":
+            acksU.append(msg.src)
+
+            if len(acksU) >= len(node_ids):
+                reply(requests[0], type="write_ok")
+
+                requests.pop(0)
+                acksU.clear()
+                waitingU = False
+                clientMsgHandler()
         else:
-            requests.append(msg)
+            if msg.src not in node_ids:
+                requests.append(msg)
+            else:
+                serverRequests.append(msg)
 
     def clientMsgHandler():
-        msg = requests[0]
+        global node_id, node_ids, data, requests, waitingR, waitingW, timestamp, quorumSizeR, quorumSizeW
 
-        # Message handlers
-        if msg.body.type == 'init':
-            node_id = msg.body.node_id
-            node_ids = msg.body.node_ids
-            logging.info('node %s initialized', node_id)
+        while True:
+            if len(requests) == 0:
+                return       
 
-            reply(msg, type='init_ok')
-        elif msg.body.type == 'read':
-            readQuorum(msg.body.key)
-        elif msg.body.type == 'write':
+            msg = requests[0]
 
-            change(key, value)
-            reply(msg, type="write_ok")
-            propagate(key, value)
-        elif msg.body.type == 'cas':
-            key = msg.body.key
-            fromValue = getattr(msg.body, 'from')
-            to = msg.body.to
+            # Message handlers
+            if msg.body.type == 'init':
+                node_id = msg.body.node_id
+                node_ids = msg.body.node_ids
+                logging.info('node %s initialized', node_id)
+                quorumSizeW = len(node_ids)
 
-            if key not in data.keys():
-                reply(msg, type="error", code=20, text=f"Key {key} not found..")
-            elif data[key] == fromValue:
-                # data[key] = to
-                change(key, to)
-                reply(msg, type="cas_ok")
-                propagate(key, to)
+                reply(msg, type='init_ok')
+                requests.pop(0)
+            elif msg.body.type == 'read':
+                readQuorum(msg.body.key)
+                waitingR = True
+                return
+            elif msg.body.type == 'write':
+                writeQuorum(msg.body.key)
+                waitingW = True
+                return
+            elif msg.body.type == 'cas':
+                reply(msg, type="undefined")
+                requests.pop(0)
             else:
-                reply(msg, type="error", code=22, text=f"Value of key {key} is not equal to {fromValue}..")
-        else:
-            logging.warning('unknown message type %s', msg.body.type)
+                logging.warning('unknown message type %s', msg.body.type)
 
-    def serverMsgHandler(msg):
+    def serverMsgHandler():
+        global node_id, node_ids, data, requests, waitingW, waitingR, waitingU, timestamp, quorumSizeR, quorumSizeW
 
-        if msg.body.type == 'update':
+        while True:
+            if len(serverRequests) <= 0:
+                return
+            msg = serverRequests.pop(0)
 
+            if msg.body.type == 'update':
+                key, value, ts = msg.body.key, msg.body.value, msg.body.timestamp
+                change(key, (value, ts))
+
+                if timestamp < ts:
+                    timestamp = ts
+                reply(msg, type="acku")
+            elif msg.body.type == 'quorumr':
+                val = read(msg.body.key) or ("None", -1)
+                reply(msg, type="ackr", value=val[0], timestamp=val[1])
+            elif msg.body.type == 'quorumw':
+                reply(msg, type="ackw", timestamp=timestamp)
     
-    if waitingW or waitingR:
+    logging.info(f"{waitingR = } {waitingW = } {waitingU = } {msg = }")
+    if waitingW or waitingR or waitingU:
         waitingHandler(msg)
     else:
-        if msg.src in node_ids():
-            serverMsgHandler(msg)
-        else
+        if msg.body.type == "init" or msg.src not in node_ids:
             requests.append(msg)
-            normalHandler()
+        else:
+            serverRequests.append(msg)
+        clientMsgHandler()
+    serverMsgHandler()
 
 # Main loop
 executor.map(lambda msg: exitOnError(handle, msg), receiveAll())
@@ -150,8 +195,4 @@ executor.map(lambda msg: exitOnError(handle, msg), receiveAll())
 
 
 ### TODO
-# 1- esperar pelo update
-# 2- esperar por ackw
-# 3- esperar por acku
-# 4- lidar msg de servidor
-# 5- enviar msg de update
+# 1- Erro linha 91 
